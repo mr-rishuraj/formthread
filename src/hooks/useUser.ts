@@ -1,6 +1,5 @@
 // ============================================================
 // FILE: src/hooks/useUser.ts
-// Replaces the mock version — uses real Supabase Auth + DB role
 // ============================================================
 import { useState, useEffect, useCallback } from 'react';
 import { supabase, signInWithGoogle, signOut } from '../lib/supabase';
@@ -9,7 +8,6 @@ import type { User } from '../types';
 async function buildUserFromSession(authUser: { id: string; email?: string }): Promise<User> {
   const email = authUser.email ?? '';
 
-  // Fetch role from public.users (set by the trigger in 03_auth_and_functions.sql)
   const { data } = await supabase
     .from('users')
     .select('role')
@@ -25,7 +23,7 @@ async function buildUserFromSession(authUser: { id: string; email?: string }): P
     name,
     role,
     initial: name[0]?.toUpperCase() ?? '?',
-    assignedFormIds: [], // not needed — RLS handles form visibility
+    assignedFormIds: [],
   };
 }
 
@@ -34,32 +32,65 @@ export function useUser() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    // 1. Check for an existing session on mount
-    supabase.auth.getSession().then(async ({ data: { session } }) => {
-      if (session?.user) {
-        const u = await buildUserFromSession(session.user);
-        setUser(u);
+    let cancelled = false;
+
+    // getSession is the correct way to restore session on refresh —
+    // it reads from localStorage synchronously then validates with Supabase
+    supabase.auth.getSession().then(async ({ data: { session }, error }) => {
+      if (cancelled) return;
+
+      if (error) {
+        console.error('getSession error:', error.message);
+        setLoading(false);
+        return;
       }
-      setLoading(false);
+
+      if (session?.user) {
+        try {
+          const u = await buildUserFromSession(session.user);
+          if (!cancelled) setUser(u);
+        } catch (err) {
+          console.error('buildUser failed:', err);
+        }
+      }
+
+      if (!cancelled) setLoading(false);
     });
 
-    // 2. Listen for auth state changes (login, logout, token refresh)
+    // Also listen for auth state changes (login, logout, token refresh)
     const { data: { subscription } } = supabase.auth.onAuthStateChange(
-      async (_event, session) => {
-        if (session?.user) {
-          const u = await buildUserFromSession(session.user);
-          setUser(u);
-        } else {
+      async (event, session) => {
+        if (cancelled) return;
+
+        if (event === 'SIGNED_OUT') {
           setUser(null);
+          setLoading(false);
+          return;
         }
-        setLoading(false);
+
+        if (session?.user) {
+          try {
+            const u = await buildUserFromSession(session.user);
+            if (!cancelled) {
+              setUser(u);
+              setLoading(false);
+            }
+          } catch (err) {
+            console.error('buildUser on auth change failed:', err);
+            if (!cancelled) setLoading(false);
+          }
+        } else {
+          if (!cancelled) setLoading(false);
+        }
       }
     );
 
-    return () => subscription.unsubscribe();
+    return () => {
+      cancelled = true;
+      subscription.unsubscribe();
+    };
   }, []);
 
-  // login() kicks off the Google OAuth redirect — no email arg needed
   const login = useCallback(() => {
     signInWithGoogle();
   }, []);

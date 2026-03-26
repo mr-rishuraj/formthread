@@ -1,8 +1,7 @@
 // ============================================================
 // FILE: src/hooks/useFormThread.ts
-// Replaces mock data with live Supabase queries + realtime
 // ============================================================
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { supabase } from '../lib/supabase';
 import {
   getMyForms,
@@ -10,6 +9,8 @@ import {
   getMessages,
   sendMessage,
   getParticipantInfo,
+  createForm,
+  createQuestion,
 } from '../queries/forms';
 import type { Form, Question, Message } from '../types';
 
@@ -22,15 +23,26 @@ export function useFormThread() {
   const [loadingForms, setLoadingForms] = useState(true);
   const [loadingQuestions, setLoadingQuestions] = useState(false);
 
+  const fetchedFormIds = useRef<Set<string>>(new Set());
+
+  // pendingSends tracks question IDs where WE just sent a message,
+  // so the Realtime echo for that message is ignored (already added optimistically)
+  const pendingSendsByQuestion = useRef<Map<string, Set<string>>>(new Map());
+
   // ── 1. Load forms on mount ───────────────────────────────
   useEffect(() => {
     setLoadingForms(true);
+
+    const timeout = setTimeout(() => setLoadingForms(false), 10000);
+
     getMyForms()
       .then(async (fetchedForms) => {
-        // Enrich each form with respondent info from participants table
         const enriched = await Promise.all(
           fetchedForms.map(async (f) => {
-            const info = await getParticipantInfo(f.id);
+            const info = await getParticipantInfo(f.id).catch(() => ({
+              respondentName: 'Respondent',
+              respondentEmail: '',
+            }));
             return { ...f, ...info };
           })
         );
@@ -39,20 +51,28 @@ export function useFormThread() {
           setSelectedFormId(enriched[0].id);
         }
       })
-      .finally(() => setLoadingForms(false));
+      .catch((err) => {
+        console.error('getMyForms failed:', JSON.stringify(err));
+      })
+      .finally(() => {
+        clearTimeout(timeout);
+        setLoadingForms(false);
+      });
+
+    return () => clearTimeout(timeout);
   }, []);
 
   // ── 2. Load questions when selected form changes ─────────
   useEffect(() => {
     if (!selectedFormId) return;
+    if (selectedFormId.startsWith('temp-')) return;
+    if (fetchedFormIds.current.has(selectedFormId)) return;
 
     setLoadingQuestions(true);
-    setQuestions([]);
-    setSelectedQuestionId(null);
+    fetchedFormIds.current.add(selectedFormId);
 
     getQuestions(selectedFormId)
       .then(async (fetchedQuestions) => {
-        // Load messages for each question in parallel
         const withMessages = await Promise.all(
           fetchedQuestions.map(async (q) => {
             const messages = await getMessages(q.id);
@@ -61,24 +81,36 @@ export function useFormThread() {
               messages.length === 0
                 ? 'unanswered'
                 : lastMsg.role === 'respondent'
-                ? 'answered'
-                : 'unanswered';
+                  ? 'answered'
+                  : 'unanswered';
             return {
               ...q,
               messages,
               status,
               unread: false,
-              lastActivity: lastMsg
-                ? lastMsg.timestamp
-                : q.lastActivity,
+              lastActivity: lastMsg ? lastMsg.timestamp : q.lastActivity,
             };
           })
         );
 
-        setQuestions(withMessages);
-        if (withMessages.length > 0) {
+        setQuestions((prev) => {
+          const localTempsForThisForm = prev.filter(
+            (q) => q.formId === selectedFormId && q.id.startsWith('temp-')
+          );
+          const otherForms = prev.filter((q) => q.formId !== selectedFormId);
+          const unresolvedTemps = localTempsForThisForm.filter(
+            (lq) => !withMessages.some((dbQ) => dbQ.id === lq.id)
+          );
+          return [...otherForms, ...withMessages, ...unresolvedTemps];
+        });
+
+        if (fetchedQuestions.length > 0) {
           setSelectedQuestionId(withMessages[0].id);
         }
+      })
+      .catch((err) => {
+        console.error('getQuestions failed:', JSON.stringify(err));
+        fetchedFormIds.current.delete(selectedFormId);
       })
       .finally(() => setLoadingQuestions(false));
   }, [selectedFormId]);
@@ -86,16 +118,13 @@ export function useFormThread() {
   // ── 3. Realtime: subscribe to new messages ───────────────
   useEffect(() => {
     if (!selectedFormId) return;
+    if (selectedFormId.startsWith('temp-')) return;
 
     const channel = supabase
       .channel(`form-messages:${selectedFormId}`)
       .on(
         'postgres_changes',
-        {
-          event: 'INSERT',
-          schema: 'public',
-          table: 'messages',
-        },
+        { event: 'INSERT', schema: 'public', table: 'messages' },
         async (payload) => {
           const newRow = payload.new as {
             id: string;
@@ -105,7 +134,30 @@ export function useFormThread() {
             created_at: string;
           };
 
-          // Fetch sender info so we can map properly
+          // ── Dedup: if THIS client sent this message, the optimistic
+          // update already added it. Drop the Realtime echo and just
+          // replace the temp id with the real DB id instead.
+          const pendingForQ = pendingSendsByQuestion.current.get(newRow.question_id);
+          if (pendingForQ && pendingForQ.size > 0) {
+            const tempId = pendingForQ.values().next().value as string | undefined;
+            if (!tempId) return;
+            pendingForQ.delete(tempId);
+            // Swap temp id → real DB id in state
+            setQuestions((prev) =>
+              prev.map((q) => {
+                if (q.id !== newRow.question_id) return q;
+                return {
+                  ...q,
+                  messages: q.messages.map((m) =>
+                    m.id === tempId ? { ...m, id: newRow.id } : m
+                  ),
+                };
+              })
+            );
+            return;
+          }
+
+          // ── New message from the OTHER client — add it ──
           const { data: senderData } = await supabase
             .from('users')
             .select('email, role')
@@ -135,9 +187,8 @@ export function useFormThread() {
           setQuestions((prev) =>
             prev.map((q) => {
               if (q.id !== newRow.question_id) return q;
-              // Avoid duplicate if optimistic update already added it
-              const exists = q.messages.some((m) => m.id === newRow.id);
-              if (exists) return q;
+              // Final safety dedup by real id
+              if (q.messages.some((m) => m.id === newRow.id)) return q;
               const updatedMessages = [...q.messages, newMessage];
               const lastMsg = updatedMessages[updatedMessages.length - 1];
               return {
@@ -153,9 +204,7 @@ export function useFormThread() {
       )
       .subscribe();
 
-    return () => {
-      supabase.removeChannel(channel);
-    };
+    return () => { supabase.removeChannel(channel); };
   }, [selectedFormId, selectedQuestionId]);
 
   // ── Derived state ────────────────────────────────────────
@@ -179,7 +228,6 @@ export function useFormThread() {
 
   const selectQuestion = useCallback((questionId: string) => {
     setSelectedQuestionId(questionId);
-    // Mark as read locally
     setQuestions((prev) =>
       prev.map((q) => (q.id === questionId ? { ...q, unread: false } : q))
     );
@@ -189,8 +237,14 @@ export function useFormThread() {
     async (questionId: string, content: string) => {
       if (!content.trim()) return;
 
-      // Optimistic update — add message immediately before DB confirms
-      const tempId = `temp-${Date.now()}`;
+      const tempId = `temp-msg-${Date.now()}`;
+
+      // Register this send so Realtime echo is recognised as ours
+      if (!pendingSendsByQuestion.current.has(questionId)) {
+        pendingSendsByQuestion.current.set(questionId, new Set());
+      }
+      pendingSendsByQuestion.current.get(questionId)!.add(tempId);
+
       const { data: { user } } = await supabase.auth.getUser();
       const { data: userData } = await supabase
         .from('users')
@@ -222,22 +276,22 @@ export function useFormThread() {
         prev.map((q) =>
           q.id === questionId
             ? {
-                ...q,
-                messages: [...q.messages, optimisticMessage],
-                status: 'answered' as const,
-                lastActivity: 'Just now',
-                unread: false,
-              }
+              ...q,
+              messages: [...q.messages, optimisticMessage],
+              status: 'answered' as const,
+              lastActivity: 'Just now',
+              unread: false,
+            }
             : q
         )
       );
 
-      // Persist to Supabase (realtime will broadcast to other clients)
       try {
         await sendMessage(questionId, content);
       } catch (err) {
         console.error('Failed to send message:', err);
-        // Roll back optimistic update on failure
+        // Remove from pending on failure
+        pendingSendsByQuestion.current.get(questionId)?.delete(tempId);
         setQuestions((prev) =>
           prev.map((q) =>
             q.id === questionId
@@ -256,6 +310,88 @@ export function useFormThread() {
     [questions]
   );
 
+  // ── addForm: optimistic → persist to Supabase ────────────
+  const addForm = useCallback(
+    async (name: string, respondentName: string, respondentEmail: string, icon: string) => {
+      const tempId = `temp-form-${Date.now()}`;
+      const optimisticForm: Form = {
+        id: tempId,
+        name,
+        description: '',
+        createdAt: new Date().toISOString().split('T')[0],
+        questionCount: 0,
+        respondentName,
+        respondentEmail,
+        icon,
+      };
+
+      setForms((prev) => [optimisticForm, ...prev]);
+      setSelectedFormId(tempId);
+      setSelectedQuestionId(null);
+      setActiveTab('All');
+
+      try {
+        const realId = await createForm(name);
+        setForms((prev) =>
+          prev.map((f) => (f.id === tempId ? { ...f, id: realId } : f))
+        );
+        fetchedFormIds.current.add(realId);
+        setSelectedFormId(realId);
+      } catch (err) {
+        console.error('Failed to create form:', JSON.stringify(err));
+        setForms((prev) => prev.filter((f) => f.id !== tempId));
+        setSelectedFormId(null);
+      }
+    },
+    []
+  );
+
+  // ── addQuestion: optimistic → persist to Supabase ────────
+  const addQuestion = useCallback(
+    async (formId: string, title: string) => {
+      const existingForForm = questions.filter((q) => q.formId === formId);
+      const orderIndex = existingForForm.length;
+      const tempId = `temp-q-${Date.now()}`;
+
+      const optimisticQuestion: Question = {
+        id: tempId,
+        formId,
+        title,
+        description: '',
+        messages: [],
+        status: 'unanswered',
+        unread: false,
+        lastActivity: 'Just now',
+      };
+
+      setQuestions((prev) => [...prev, optimisticQuestion]);
+      setForms((prev) =>
+        prev.map((f) =>
+          f.id === formId ? { ...f, questionCount: existingForForm.length + 1 } : f
+        )
+      );
+      setSelectedQuestionId(tempId);
+
+      try {
+        const realId = await createQuestion(formId, title, orderIndex);
+        setQuestions((prev) =>
+          prev.map((q) => (q.id === tempId ? { ...q, id: realId } : q))
+        );
+        setSelectedQuestionId(realId);
+      } catch (err) {
+        console.error('Failed to create question:', JSON.stringify(err));
+        setQuestions((prev) => prev.filter((q) => q.id !== tempId));
+        setForms((prev) =>
+          prev.map((f) =>
+            f.id === formId ? { ...f, questionCount: existingForForm.length } : f
+          )
+        );
+        setSelectedQuestionId(null);
+      }
+    },
+    [questions]
+  );
+
   return {
     forms,
     visibleQuestions,
@@ -269,6 +405,8 @@ export function useFormThread() {
     selectForm,
     selectQuestion,
     sendReply,
+    addForm,
+    addQuestion,
     unreadCount,
     loadingForms,
     loadingQuestions,

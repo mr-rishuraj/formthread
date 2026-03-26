@@ -9,6 +9,7 @@ interface SidebarProps {
   unreadCount: (formId: string) => number;
   user: User;
   onLogout: () => void;
+  onCreateForm?: () => void;
 }
 
 const Sidebar: React.FC<SidebarProps> = ({
@@ -19,9 +20,10 @@ const Sidebar: React.FC<SidebarProps> = ({
   unreadCount,
   user,
   onLogout,
+  onCreateForm,
 }) => {
 
-  if (!user) return null; // 🔥 prevents crash
+  if (!user) return null;
 
   const isAdmin = user?.role === 'admin';
 
@@ -46,6 +48,7 @@ const Sidebar: React.FC<SidebarProps> = ({
         {/* Admin only — "+ Create Form" */}
         {isAdmin && (
           <button
+            onClick={onCreateForm}
             title="Create new form"
             className="w-5 h-5 flex items-center justify-center text-zinc-600 hover:text-amber-400 hover:bg-zinc-800 rounded-sm transition-colors duration-100 font-mono text-[14px] leading-none"
           >

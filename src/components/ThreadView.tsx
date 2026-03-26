@@ -41,15 +41,12 @@ const ThreadView: React.FC<ThreadViewProps> = ({
 }) => {
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  // ✅ ALWAYS compute safely (before guard)
   const isAdmin = user?.role === 'admin';
 
-  // ✅ Hooks MUST be before any return
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [question?.messages.length, question?.id]);
 
-  // ✅ Guard AFTER hooks
   if (!user) return null;
 
   if (!question) {
@@ -68,6 +65,21 @@ const ThreadView: React.FC<ThreadViewProps> = ({
   const status = STATUS_CONFIG[question.status];
   const respondentInitial = (form?.respondentName?.[0] ?? 'R').toUpperCase();
 
+  // Always derive a clean display name from email as fallback
+  const cleanName = (raw: string, email: string) => {
+    if (raw && raw.trim() && raw !== email) return raw;
+    const part = email.split('@')[0];
+    return part.charAt(0).toUpperCase() + part.slice(1).replace(/[._-]/g, ' ');
+  };
+
+  const replyName = isAdmin
+    ? cleanName(user.name, user.email)
+    : cleanName(form?.respondentName ?? '', form?.respondentEmail ?? user.email);
+
+  const replyInitial = isAdmin
+    ? (cleanName(user.name, user.email)[0] ?? 'A').toUpperCase()
+    : respondentInitial;
+
   return (
     <div className="flex-1 flex flex-col min-w-0 bg-zinc-950/30">
       {/* Thread header */}
@@ -77,7 +89,6 @@ const ThreadView: React.FC<ThreadViewProps> = ({
             <h2 className="text-[13px] font-semibold text-zinc-100 leading-snug">
               {question.title}
             </h2>
-            {/* Admin-only edit hint */}
             {isAdmin && (
               <button
                 title="Edit question (admin only)"
@@ -109,7 +120,7 @@ const ThreadView: React.FC<ThreadViewProps> = ({
             Question context
           </p>
           <p className="text-[12px] text-zinc-400 leading-[1.65]">
-            {question.description}
+            {question.description || <span className="text-zinc-700 italic">No context provided</span>}
           </p>
         </div>
       </div>
@@ -130,8 +141,8 @@ const ThreadView: React.FC<ThreadViewProps> = ({
       <div className="px-6 pb-5 pt-3 flex-shrink-0 border-t border-zinc-800">
         <ReplyBox
           onSend={(content) => onSendReply(question.id, content)}
-          respondentName={isAdmin ? user.name : (form?.respondentName ?? 'Respondent')}
-          respondentInitial={isAdmin ? user.initial : respondentInitial}
+          respondentName={replyName}
+          respondentInitial={replyInitial}
         />
       </div>
     </div>

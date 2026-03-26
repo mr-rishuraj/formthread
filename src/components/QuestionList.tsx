@@ -1,6 +1,7 @@
 import React from 'react';
 import { Form, Question } from '../types';
 import QuestionItem from './QuestionItem';
+import AddQuestionInput from './AddQuestionInput';
 
 type TabOption = 'All' | 'Awaiting' | 'Answered';
 
@@ -12,6 +13,8 @@ interface QuestionListProps {
   activeTab: TabOption;
   onSelectQuestion: (id: string) => void;
   onTabChange: (tab: TabOption) => void;
+  isAdmin?: boolean;
+  onAddQuestion?: (title: string) => void;
 }
 
 const TABS: TabOption[] = ['All', 'Awaiting', 'Answered'];
@@ -24,6 +27,8 @@ const QuestionList: React.FC<QuestionListProps> = ({
   activeTab,
   onSelectQuestion,
   onTabChange,
+  isAdmin,
+  onAddQuestion,
 }) => {
   const awaitingCount = allFormQuestions.filter((q) => q.status === 'unanswered').length;
   const followUpCount = allFormQuestions.filter((q) => q.status === 'needs-clarification').length;
@@ -90,6 +95,11 @@ const QuestionList: React.FC<QuestionListProps> = ({
           ))
         )}
       </div>
+
+      {/* Admin-only: add question input sits between list and footer */}
+      {isAdmin && onAddQuestion && form && (
+        <AddQuestionInput onAdd={onAddQuestion} />
+      )}
 
       {/* Footer */}
       <div className="px-4 py-2.5 border-t border-zinc-800">

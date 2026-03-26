@@ -36,10 +36,10 @@ function mapForm(db: DBForm): Form {
   return {
     id: db.id,
     name: db.title,
-    description: '',           // not in schema — add a column if needed
+    description: '',
     createdAt: db.created_at.split('T')[0],
-    questionCount: 0,          // filled after fetching questions
-    respondentName: '',        // filled from participants
+    questionCount: 0,
+    respondentName: '',
     respondentEmail: '',
     icon: '◈',
   };
@@ -50,18 +50,17 @@ function mapQuestion(db: DBQuestion): Omit<Question, 'messages' | 'status' | 'un
     id: db.id,
     formId: db.form_id,
     title: db.title,
-    description: '',           // not in schema — add a column if needed
+    description: '',
   };
 }
 
-function mapMessage(db: DBMessage, userRole: 'admin' | 'participant'): Message {
+function mapMessage(db: DBMessage, _userRole: 'admin' | 'participant'): Message {
   const userObj = db.users?.[0];
   const senderEmail = userObj?.email ?? '';
   const namePart = senderEmail.split('@')[0];
   const senderName = namePart.charAt(0).toUpperCase() + namePart.slice(1).replace(/[._-]/g, ' ');
   return {
     id: db.id,
-    // admin messages are 'creator', participant messages are 'respondent'
     role: (userObj?.role === 'admin') ? 'creator' : 'respondent',
     content: db.content,
     timestamp: new Date(db.created_at).toLocaleString('en-US', {
@@ -78,10 +77,6 @@ function mapMessage(db: DBMessage, userRole: 'admin' | 'participant'): Message {
 
 // ── Forms ─────────────────────────────────────────────────────
 
-/**
- * Fetch all forms accessible to the current user.
- * RLS handles admin-vs-participant filtering automatically.
- */
 export async function getMyForms(): Promise<Form[]> {
   const { data, error } = await supabase
     .from('forms')
@@ -92,12 +87,26 @@ export async function getMyForms(): Promise<Form[]> {
   return (data as DBForm[]).map(mapForm);
 }
 
+/**
+ * Create a new form in Supabase. Returns the new form's DB id.
+ * Admin only — RLS enforces this.
+ */
+export async function createForm(title: string): Promise<string> {
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) throw new Error('Not authenticated');
+
+  const { data, error } = await supabase
+    .from('forms')
+    .insert({ title, created_by: user.id })
+    .select('id')
+    .single();
+
+  if (error) throw error;
+  return data.id;
+}
+
 // ── Questions ─────────────────────────────────────────────────
 
-/**
- * Fetch all questions for a form, returning full Question objects
- * with empty messages arrays (messages loaded separately).
- */
 export async function getQuestions(formId: string): Promise<Question[]> {
   const { data, error } = await supabase
     .from('questions')
@@ -118,11 +127,27 @@ export async function getQuestions(formId: string): Promise<Question[]> {
   }));
 }
 
+/**
+ * Create a new question under a form. Returns the DB-assigned id.
+ * Admin only — RLS enforces this.
+ */
+export async function createQuestion(
+  formId: string,
+  title: string,
+  orderIndex: number
+): Promise<string> {
+  const { data, error } = await supabase
+    .from('questions')
+    .insert({ form_id: formId, title, order_index: orderIndex })
+    .select('id')
+    .single();
+
+  if (error) throw error;
+  return data.id;
+}
+
 // ── Messages ──────────────────────────────────────────────────
 
-/**
- * Fetch all messages for a question, with sender info joined.
- */
 export async function getMessages(questionId: string): Promise<Message[]> {
   const { data, error } = await supabase
     .from('messages')
@@ -134,9 +159,6 @@ export async function getMessages(questionId: string): Promise<Message[]> {
   return (data as DBMessage[]).map((m) => mapMessage(m, m.users?.[0]?.role as 'admin' | 'participant'));
 }
 
-/**
- * Insert a new message for the current logged-in user.
- */
 export async function sendMessage(questionId: string, content: string): Promise<void> {
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) throw new Error('Not authenticated');
@@ -160,9 +182,6 @@ type DBParticipant = {
   users: { email: string }[] | null;
 };
 
-/**
- * Fetch participant info for a form (used to fill respondentName/Email on Form).
- */
 export async function getParticipantInfo(
   formId: string
 ): Promise<{ respondentName: string; respondentEmail: string }> {
